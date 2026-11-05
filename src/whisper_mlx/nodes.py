@@ -133,14 +133,25 @@ def format_transcriptions_to_subtitle(transcriptions: List[Dict], fmt: str,
     else:
         raise ValueError(f"Unsupported format {fmt}")
 
-def get_incremented_filename(out_dir: str, prefix: str, ext: str) -> str:
+def get_incremented_filename(root_out_dir: str, prefix: str, ext: str) -> str:
+    """
+    prefix支持子目录，如 "audio/tts"
+    最终路径: root_out_dir / prefix_{idx}.ext
+    """
+    prefix_path = Path(prefix)
+    sub_dir_part = prefix_path.parent
+    file_stem = prefix_path.name
+
+    target_parent = Path(root_out_dir) / sub_dir_part
+    target_parent.mkdir(parents=True, exist_ok=True)
+
     idx = 1
     while True:
-        name = f"{prefix}_{idx}.{ext}"
-        fp = os.path.join(out_dir, name)
-        if not os.path.exists(fp):
-            return fp
-        idx +=1
+        filename = f"{file_stem}_{idx}.{ext}"
+        full_path = target_parent / filename
+        if not full_path.exists():
+            return str(full_path)
+        idx += 1
 
 # =========================
 # 🔹 MLX‑Whisper 模型加载节点（参考 Qwen3ASRMLXLoader，按本地文件夹路径，带内存缓存）
@@ -294,19 +305,33 @@ class MLXWhisperSaveSubtitle:
                 "subtitle": ("MLX_WHISPER_SUBTITLE", )
             },
             "optional": {
-                "prefix": ("STRING", {"default": "mlx_whisper_subtitle"}),
+                "output_dir": ("STRING", {
+                    "default": "",
+                    "tooltip": "输出根目录；留空使用ComfyUI默认output目录"
+                }),
+                "prefix": ("STRING", {
+                    "default": "mlx_whisper_subtitle",
+                    "tooltip": "支持子目录，例如 audio/tts → 在output_dir/audio/下生成 tts_1.json"
+                }),
             }
         }
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("output_file_path",)
     FUNCTION = "save_subtitle"
     OUTPUT_NODE = True
-    CATEGORY = "MLX‑WHISPER‑ASR"
+    CATEGORY = "MLX-WHISPER-ASR"
 
-    def save_subtitle(self, subtitle: List, prefix: str):
+    def save_subtitle(self, subtitle: List, output_dir: str, prefix: str):
         sub_text, fmt = subtitle
-        out_dir = folder_paths.get_output_directory()
-        out_path = get_incremented_filename(out_dir, prefix, fmt)
+
+        # output_dir为空则回退comfy默认output
+        if output_dir.strip() == "":
+            out_root = folder_paths.get_output_directory()
+        else:
+            out_root = output_dir.strip()
+
+        out_path = get_incremented_filename(out_root, prefix, fmt)
+
         with open(out_path, "w", encoding="utf-8") as f:
             f.write(sub_text)
         return (out_path,)
