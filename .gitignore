@@ -112,3 +112,9 @@ yarn-error.log*
 node.zip
 .vscode/
 .claude/
+
+
+# vim
+.*.swp
+.*.swo
+tags

@@ -1,118 +1,351 @@
-from inspect import cleandoc
-class Example:
-    """
-    A example node
+import os
+import json
+from pathlib import Path
+from typing import Union, Dict, List, Tuple
+import folder_paths
+from comfy.utils import ProgressBar
+from mlx_whisper import transcribe
 
-    Class methods
-    -------------
-    INPUT_TYPES (dict):
-        Tell the main program input parameters of nodes.
-    IS_CHANGED:
-        optional method to control when the node is re executed.
+# ====================== 字幕常量，沿用你Qwen3‑ASR nodes.py ==================
+SUBTITLE_MAX_CHARS = 35
+SUBTITLE_MAX_DURATION_S = 6.0
+SUBTITLE_SPLIT_PUNCT = "，。！？；"
+SUBTITLE_SPLIT_PUNCT_EN = ",.!?;"
+TRIM_PUNCT_EXCEPT = "！？!?"
 
-    Attributes
-    ----------
-    RETURN_TYPES (`tuple`):
-        The type of each element in the output tulple.
-    RETURN_NAMES (`tuple`):
-        Optional: The name of each output in the output tulple.
-    FUNCTION (`str`):
-        The name of the entry-point method. For example, if `FUNCTION = "execute"` then it will run Example().execute()
-    OUTPUT_NODE ([`bool`]):
-        If this node is an output node that outputs a result/image from the graph. The SaveImage node is an example.
-        The backend iterates on these output nodes and tries to execute all their parents if their parent graph is properly connected.
-        Assumed to be False if not present.
-    CATEGORY (`str`):
-        The category the node should appear in the UI.
-    execute(s) -> tuple || None:
-        The entry point method. The name of this method must be the same as the value of property `FUNCTION`.
-        For example, if `FUNCTION = "execute"` then this method's name must be `execute`, if `FUNCTION = "foo"` then it must be `foo`.
-    """
-    def __init__(self):
-        pass
+AVAILABLE_SUBTITLE_FORMAT = ["txt", "srt", "vtt", "json", "lrc"]
+FLOAT_NONE_VALUE = -999.0
+INT_NONE_VALUE = -999
+
+# ------------------------------ 字幕工具函数 ------------------------------
+def split_by_text_ratio_interpolate(seg_items, max_chars: int, max_dur: float, puncts: str):
+    out = []
+    punct_set = set(puncts)
+    for seg in seg_items:
+        if isinstance(seg, dict):
+            seg_start = seg.get("start", 0.0)
+            seg_end = seg.get("end", 0.0)
+            full_text = seg.get("text", "").strip()
+        else:
+            seg_start = getattr(seg, "start", 0.0)
+            seg_end = getattr(seg, "end", 0.0)
+            full_text = getattr(seg, "text", "").strip()
+        seg_total_dur = seg_end - seg_start
+        if not full_text or seg_total_dur <= 1e-6:
+            out.append({"start": seg_start, "end": seg_end, "text": full_text})
+            continue
+        pieces = []
+        buf = []
+        for ch in full_text:
+            buf.append(ch)
+            buf_str = "".join(buf)
+            if ch in punct_set or len(buf_str) >= max_chars:
+                piece = buf_str.strip()
+                while len(piece) > 0 and piece[-1] in punct_set and piece[-1] not in TRIM_PUNCT_EXCEPT:
+                    piece = piece[:-1].strip()
+                if piece:
+                    pieces.append(piece)
+                buf.clear()
+        if buf:
+            piece = "".join(buf).strip()
+            if piece:
+                pieces.append(piece)
+        if len(pieces) == 0:
+            out.append({"start": seg_start, "end": seg_end, "text": full_text})
+            continue
+        total_char = sum(len(p) for p in pieces)
+        cur_t = seg_start
+        for piece in pieces:
+            char_cnt = len(piece)
+            ratio = char_cnt / total_char
+            piece_dur = seg_total_dur * ratio
+            p_end = cur_t + piece_dur
+            out.append({"start": cur_t, "end": p_end, "text": piece})
+            cur_t = p_end
+    return out
+
+def format_timestamp(seconds: float) -> str:
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    sec = seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{sec:06.3f}".replace(".", ",")
+
+def format_vtt_timestamp(seconds: float) -> str:
+    return format_timestamp(seconds).replace(",", ".")
+
+def format_lrc_timestamp(seconds: float) -> str:
+    mm = int(seconds // 60)
+    ss = seconds % 60
+    return f"{mm:02d}:{ss:05.2f}"
+
+def format_transcriptions_to_subtitle(transcriptions: List[Dict], fmt: str,
+                                     lrc_meta: Dict = None) -> str:
+    lrc_meta = lrc_meta or {}
+    if fmt == "txt":
+        return "\n".join(s["text"].strip() for s in transcriptions)
+    elif fmt == "srt":
+        lines = []
+        for idx, seg in enumerate(transcriptions, start=1):
+            s = format_timestamp(seg["start"])
+            e = format_timestamp(seg["end"])
+            lines.append(f"{idx}\n{s} --> {e}\n{seg['text'].strip()}\n")
+        return "\n".join(lines)
+    elif fmt == "vtt":
+        lines = ["WEBVTT", ""]
+        for idx, seg in enumerate(transcriptions, start=1):
+            s = format_vtt_timestamp(seg["start"])
+            e = format_vtt_timestamp(seg["end"])
+            lines.append(f"{idx}\n{s} --> {e}\n{seg['text'].strip()}\n")
+        return "\n".join(lines)
+    elif fmt == "json":
+        return json.dumps({"segments": transcriptions}, ensure_ascii=False, indent=2)
+    elif fmt == "lrc":
+        lrc_lines = []
+        ti = lrc_meta.get("title","").strip()
+        ar = lrc_meta.get("artist","").strip()
+        al = lrc_meta.get("album","").strip()
+        by = lrc_meta.get("lrc_by","").strip()
+        if ti: lrc_lines.append(f"[ti:{ti}]")
+        if ar: lrc_lines.append(f"[ar:{ar}]")
+        if al: lrc_lines.append(f"[al:{al}]")
+        if by: lrc_lines.append(f"[by:{by}]")
+        if lrc_lines:
+            lrc_lines.append("")
+        for seg in transcriptions:
+            seg_start = seg["start"]
+            seg_end = seg["end"]
+            seg_text = seg["text"].rstrip("%").strip()
+            sub_lines = [ln.strip() for ln in seg_text.splitlines() if ln.strip()]
+            if not sub_lines:
+                continue
+            dur_total = seg_end - seg_start
+            line_cnt = len(sub_lines)
+            if line_cnt ==1:
+                t_str = format_lrc_timestamp(seg_start)
+                lrc_lines.append(f"[{t_str}]{sub_lines[0]}")
+            else:
+                step = dur_total / line_cnt
+                for i, sub_text in enumerate(sub_lines):
+                    lt = seg_start + step*i
+                    t_str = format_lrc_timestamp(lt)
+                    lrc_lines.append(f"[{t_str}]{sub_text}")
+        return "\n".join(lrc_lines)
+    else:
+        raise ValueError(f"Unsupported format {fmt}")
+
+def get_incremented_filename(out_dir: str, prefix: str, ext: str) -> str:
+    idx = 1
+    while True:
+        name = f"{prefix}_{idx}.{ext}"
+        fp = os.path.join(out_dir, name)
+        if not os.path.exists(fp):
+            return fp
+        idx +=1
+
+# =========================
+# 🔹 MLX‑Whisper 模型加载节点（参考 Qwen3ASRMLXLoader，按本地文件夹路径，带内存缓存）
+# =========================
+class MLXWhisperLoader:
+    _model_cache = {}
 
     @classmethod
-    def INPUT_TYPES(s):
-        """
-            Return a dictionary which contains config for all input fields.
-            Some types (string): "MODEL", "VAE", "CLIP", "CONDITIONING", "LATENT", "IMAGE", "INT", "STRING", "FLOAT".
-            Input types "INT", "STRING" or "FLOAT" are special values for fields on the node.
-            The type can be a list for selection.
-
-            Returns: `dict`:
-                - Key input_fields_group (`string`): Can be either required, hidden or optional. A node class must have property `required`
-                - Value input_fields (`dict`): Contains input fields config:
-                    * Key field_name (`string`): Name of a entry-point method's argument
-                    * Value field_config (`tuple`):
-                        + First value is a string indicate the type of field or a list for selection.
-                        + Secound value is a config for type "INT", "STRING" or "FLOAT".
-        """
+    def INPUT_TYPES(cls):
         return {
             "required": {
-                "image": ("Image", { "tooltip": "This is an image"}),
-                "int_field": ("INT", {
-                    "default": 0,
-                    "min": 0, #Minimum value
-                    "max": 4096, #Maximum value
-                    "step": 64, #Slider's step
-                    "display": "number" # Cosmetic only: display as "number" or "slider"
+                "model_local_dir": ("STRING", {
+                    "default": "/path/to/whisper‑large‑v3‑turbo",
+                    "tooltip": "本地HF模型文件夹绝对路径，hfd.sh下载的目录，内含config.json"
                 }),
-                "float_field": ("FLOAT", {
-                    "default": 1.0,
-                    "min": 0.0,
-                    "max": 10.0,
-                    "step": 0.01,
-                    "round": 0.001, #The value represeting the precision to round to, will be set to the step value by default. Can be set to False to disable rounding.
-                    "display": "number"}),
-                "print_to_screen": (["enable", "disable"],),
-                "string_field": ("STRING", {
-                    "multiline": False, #True if you want the field to look like the one on the ClipTextEncode node
-                    "default": "Hello World!"
-                }),
-            },
+            }
         }
 
-    RETURN_TYPES = ("IMAGE",)
-    #RETURN_NAMES = ("image_output_name",)
-    DESCRIPTION = cleandoc(__doc__)
-    FUNCTION = "test"
+    RETURN_TYPES = ("MLX_WHISPER_MODEL",)
+    RETURN_NAMES = ("model_handle",)
+    FUNCTION = "load_model_node"
+    CATEGORY = "MLX‑WHISPER‑ASR"
 
-    #OUTPUT_NODE = False
-    #OUTPUT_TOOLTIPS = ("",) # Tooltips for the output node
+    def load_model_node(self, model_local_dir):
+        key = str(Path(model_local_dir).absolute())
+        if key in self._model_cache:
+            return (self._model_cache[key],)
+        # mlx‑whisper transcribe直接接收本地文件夹路径作为path_or_hf_repo，不需要预加载对象；保存路径句柄
+        if not os.path.isdir(key):
+            raise NotADirectoryError(f"MLX‑Whisper模型目录不存在：{key}")
+        cfg = os.path.join(key, "config.json")
+        if not os.path.exists(cfg):
+            raise FileNotFoundError(f"模型目录缺少config.json，请检查hfd.sh下载的文件夹: {key}")
+        handle = {"local_model_path": key}
+        self._model_cache[key] = handle
+        print(f"✅ MLX‑Whisper 已缓存本地模型：{key}")
+        return (handle,)
 
-    CATEGORY = "Example"
+# =========================
+# 🔹 MLX‑Whisper 转写节点（参考 faster‑whisper节点架构）
+# 输入 FILEPATH，输出 MLX_WHISPER_TRANSCRIPTIONS 结构化列表；携带word时间戳
+# =========================
+class MLXWhisperTranscription:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "audio": ("FILEPATH", ),
+                "model_handle": ("MLX_WHISPER_MODEL", ),
+            },
+            "optional": {
+                "language": ("STRING", {"default": "auto"}),
+                "word_timestamps": ("BOOLEAN", {"default": True, "tooltip":"开启返回每个单词start/end时间戳"}),
+                "verbose": ("BOOLEAN", {"default": False}),
+                "auto_split_subtitle": ("BOOLEAN", {"default": True, "tooltip":"按标点字符插值切分字幕段"}),
+            }
+        }
 
-    def test(self, image, string_field, int_field, float_field, print_to_screen):
-        if print_to_screen == "enable":
-            print(f"""Your input contains:
-                string_field aka input text: {string_field}
-                int_field: {int_field}
-                float_field: {float_field}
-            """)
-        #do some processing on the image, in this example I just invert it
-        image = 1.0 - image
-        return (image,)
+    RETURN_TYPES = ("MLX_WHISPER_TRANSCRIPTIONS", )
+    RETURN_NAMES = ("transcriptions", )
+    FUNCTION = "transcribe"
+    CATEGORY = "MLX‑WHISPER‑ASR"
 
-    """
-        The node will always be re executed if any of the inputs change but
-        this method can be used to force the node to execute again even when the inputs don't change.
-        You can make this node return a number or a string. This value will be compared to the one returned the last time the node was
-        executed, if it is different the node will be executed again.
-        This method is used in the core repo for the LoadImage node where they return the image hash as a string, if the image hash
-        changes between executions the LoadImage node is executed again.
-    """
-    #@classmethod
-    #def IS_CHANGED(s, image, string_field, int_field, float_field, print_to_screen):
-    #    return ""
+    def transcribe(self,
+                   audio: str,
+                   model_handle: Dict,
+                   language="auto",
+                   word_timestamps=True,
+                   verbose=False,
+                   auto_split_subtitle=True
+                   ) -> Tuple[List]:
+        local_model_path = model_handle["local_model_path"]
+        lang_arg = None if language == "auto" else language
+
+        result = transcribe(
+            audio=audio,
+            path_or_hf_repo=local_model_path,
+            word_timestamps=word_timestamps,
+            language=lang_arg,
+            verbose=verbose
+        )
+        raw_segments = result.get("segments", [])
+        total_dur = result.get("duration", 0.0)
+        pbar = ProgressBar(total_dur)
+
+        if auto_split_subtitle:
+            all_punct = SUBTITLE_SPLIT_PUNCT + SUBTITLE_SPLIT_PUNCT_EN
+            seg_list = split_by_text_ratio_interpolate(raw_segments,
+                                                       max_chars=SUBTITLE_MAX_CHARS,
+                                                       max_dur=SUBTITLE_MAX_DURATION_S,
+                                                       puncts=all_punct)
+        else:
+            seg_list = []
+            for seg in raw_segments:
+                seg_list.append({
+                    "start": seg.get("start", 0.0),
+                    "end": seg.get("end", 0.0),
+                    "text": seg.get("text", "").strip(),
+                    "words": seg.get("words", [])
+                })
+                pbar.update_absolute(seg.get("end",0.0))
+        return (seg_list,)
+
+# =========================
+# 🔹 MLXWhisperToSubtitle：结构化transcriptions → 字幕文本对象，参考FasterWhisperToSubtitle
+# =========================
+class MLXWhisperToSubtitle:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "transcriptions": ("MLX_WHISPER_TRANSCRIPTIONS",),
+                "subtitle_format": (AVAILABLE_SUBTITLE_FORMAT,),
+            },
+            "optional": {
+                "lrc_title": ("STRING", {"default": ""}),
+                "lrc_artist": ("STRING", {"default": ""}),
+                "lrc_album": ("STRING", {"default": ""}),
+                "lrc_by": ("STRING", {"default": "MLX‑Whisper"}),
+            }
+        }
+
+    RETURN_TYPES = ("MLX_WHISPER_SUBTITLE", )
+    RETURN_NAMES = ("subtitle", )
+    FUNCTION = "format_to_subtitle"
+    CATEGORY = "MLX‑WHISPER‑ASR"
+
+    def format_to_subtitle(self,
+                           transcriptions: List[Dict],
+                           subtitle_format: str,
+                           lrc_title="", lrc_artist="", lrc_album="", lrc_by=""
+                           ) -> Tuple[List]:
+        lrc_meta = {
+            "title": lrc_title,
+            "artist": lrc_artist,
+            "album": lrc_album,
+            "lrc_by": lrc_by
+        }
+        text = format_transcriptions_to_subtitle(transcriptions, subtitle_format, lrc_meta=lrc_meta)
+        subtitle_package = [text, subtitle_format]
+        return (subtitle_package,)
+
+# =========================
+# 🔹 保存字幕节点：参考SaveSubtitle，输出到comfyui标准output目录，自动递增文件名
+# =========================
+class MLXWhisperSaveSubtitle:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "subtitle": ("MLX_WHISPER_SUBTITLE", )
+            },
+            "optional": {
+                "prefix": ("STRING", {"default": "mlx_whisper_subtitle"}),
+            }
+        }
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("output_file_path",)
+    FUNCTION = "save_subtitle"
+    OUTPUT_NODE = True
+    CATEGORY = "MLX‑WHISPER‑ASR"
+
+    def save_subtitle(self, subtitle: List, prefix: str):
+        sub_text, fmt = subtitle
+        out_dir = folder_paths.get_output_directory()
+        out_path = get_incremented_filename(out_dir, prefix, fmt)
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(sub_text)
+        return (out_path,)
+
+# =========================
+# 输入文件路径节点，输出 FILEPATH 类型（和faster‑whisper InputFilePath保持一致）
+# =========================
+class MLXWhisperInputFilePath:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "filepath": ("STRING", {"default": "", "multiline": False})
+            }
+        }
+    RETURN_TYPES = ("FILEPATH", )
+    RETURN_NAMES = ("filepath",)
+    FUNCTION = "process_filepath"
+    CATEGORY = "MLX‑WHISPER‑ASR"
+
+    def process_filepath(self, filepath):
+        fp = Path(filepath).absolute()
+        if not fp.exists():
+            raise FileNotFoundError(f"音频文件不存在: {fp}")
+        return (str(fp),)
 
 
-# A dictionary that contains all nodes you want to export with their names
-# NOTE: names should be globally unique
 NODE_CLASS_MAPPINGS = {
-    "Example": Example
+    "MLXWhisperLoader": MLXWhisperLoader,
+    "MLXWhisperTranscription": MLXWhisperTranscription,
+    "MLXWhisperToSubtitle": MLXWhisperToSubtitle,
+    "MLXWhisperSaveSubtitle": MLXWhisperSaveSubtitle,
+    "MLXWhisperInputFilePath": MLXWhisperInputFilePath
 }
 
-# A dictionary that contains the friendly/humanly readable titles for the nodes
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "Example": "Example Node"
+    "MLXWhisperLoader": "MLX‑Whisper Loader(本地模型目录)",
+    "MLXWhisperTranscription": "MLX‑Whisper Transcription",
+    "MLXWhisperToSubtitle": "MLX‑Whisper To Subtitle",
+    "MLXWhisperSaveSubtitle": "MLX‑Whisper Save Subtitle",
+    "MLXWhisperInputFilePath": "MLX‑Whisper Input FilePath"
 }
